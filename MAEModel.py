@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 
+# 原论文中在多头注意力之后 使用的是dropout层，有其他大神用droppath实现，效果更好
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
@@ -42,7 +43,7 @@ class DropPath(nn.Module):
 
 class PatchEmbed(nn.Module):
     """
-    2D Image to Patch Embedding
+    将一张2D图像划分成多个图像块，这个过程实际是卷积实现的。之后将每个图像块映射成一维向量，作为transformer的真正输入
     """
     def __init__(self, img_size=224, patch_size=16, in_c=3, embed_dim=768, norm_layer=None):
         super().__init__()
@@ -50,11 +51,15 @@ class PatchEmbed(nn.Module):
         patch_size = (patch_size, patch_size)
         self.img_size = img_size
         self.patch_size = patch_size
+
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
 
         self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+        if norm_layer:
+            self.norm = norm_layer(embed_dim)
+        else: nn.Identity()
+        # self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -68,6 +73,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
+# 多头注意力
 class Attention(nn.Module):
     def __init__(self,
                  dim,   # 输入token的dim
@@ -77,13 +83,17 @@ class Attention(nn.Module):
                  attn_drop_ratio=0.,
                  proj_drop_ratio=0.):
         super(Attention, self).__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
+        self.num_heads = num_heads # 注意力头的数量
+        head_dim = dim // num_heads # 每个注意力头对应的维度大小
+
+        # 缩放点积的分母
         self.scale = qk_scale or head_dim ** -0.5
 
-        # 这里作者直接用 dim * 3 得到qkv三个向量
+        # 这里作者直接用 dim * 3 得到qkv三个向量，推测是为了并行化计算加快训练速度。
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop_ratio)
+
+        # 多头注意力拼接，得到最终的输出
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop_ratio)
 
@@ -103,14 +113,15 @@ class Attention(nn.Module):
 
         # transpose: -> [batch_size, num_heads, embed_dim_per_head, num_patches + 1]
         # @: multiply -> [batch_size, num_heads, num_patches + 1, num_patches + 1]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale # q和k进行多维矩阵乘法时，实际只有最后两个维度相乘
+        attn = attn.softmax(dim=-1)# 按行进行柔性最大值处理
         attn = self.attn_drop(attn)
 
         # @: multiply -> [batch_size, num_heads, num_patches + 1, embed_dim_per_head]
         # transpose: -> [batch_size, num_patches + 1, num_heads, embed_dim_per_head]
         # reshape: -> [batch_size, num_patches + 1, total_embed_dim]
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C) # 和v矩阵相乘 加权求和
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -138,6 +149,7 @@ class Mlp(nn.Module):
         return x
 
 
+# transformer编码器模块，包含自注意力和MLP
 class Block(nn.Module):
     def __init__(self,
                  dim,
@@ -166,8 +178,6 @@ class Block(nn.Module):
         return x
 
 
-
-
 class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_c=3, num_classes=1000,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, qkv_bias=True,
@@ -181,7 +191,7 @@ class VisionTransformer(nn.Module):
             in_c (int): number of input channels
             num_classes (int): number of classes for classification head
             embed_dim (int): embedding dimension
-            depth (int): depth of transformer
+            depth (int): transformer编码器重复的次数
             num_heads (int): number of attention heads
             mlp_ratio (int): ratio of mlp hidden dim to embedding dim
             qkv_bias (bool): enable bias for qkv if True
@@ -204,6 +214,7 @@ class VisionTransformer(nn.Module):
         self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_c=in_c, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
+        # 第一个维度的1对应的是批量
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
